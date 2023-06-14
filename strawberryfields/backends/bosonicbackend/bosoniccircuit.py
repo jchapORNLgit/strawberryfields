@@ -93,7 +93,7 @@ def from_xp(num_modes):
     return perm_inds
 
 
-def update_means(means, X, perm_out):
+def update_means(means, X, perm_out,d=None):
     r"""Apply a linear transformation ``X`` to the array of means. The
     quadrature ordering can be specified by ``perm_out`` to match ordering
     of ``X`` to means.
@@ -102,12 +102,18 @@ def update_means(means, X, perm_out):
         means (array): array of mean vectors
         X (array): matrix for linear transformation
         perm_out (array): indices for quadrature ordering
+        d (vector): displacement vector ordered all x followed by all p 
+                    i.e.,(x1,...,xn,p1,..., pn)
 
     Returns:
         array: transformed array of mean vectors
     """
     X_perm = X[:, perm_out][perm_out, :]
-    return (X_perm @ means.T).T
+    if d is not None:
+        d = d[:, perm_out]
+    else:
+        d = 0.0
+    return (X_perm @ means.T).T + d
 
 
 def update_covs(covs, X, perm_out, Y=None):
@@ -372,6 +378,193 @@ class BosonicModes:
         self.phase_shift(phi / 2, k)
 
         return val
+
+    def mb_NG_avg(self, modes, X, Y, d, f):
+        r"""Phase space measurement-based non-Gaussian gate.
+
+        This implements the two-mode non-Gaussian transformation described
+        Sec. IIIC of https://link.aps.org/doi/10.1103/PRXQuantum.2.040315.
+
+        The two input modes and the measurement can be non-Gaussian. For
+        the measurement, we assume projection onto a Fock state (to simulate
+        photon-number resolved detection) for each measured mode with photon 
+        number from the list f.
+
+        X, Y, and d are ordered all x followed by all p: (x1,...,xn,p1,..., pn)
+
+        Args:
+            modes (array): See Modes section below for uses.
+            X (array): 2nx2n matrix, where n=2 is the number of modes involved
+            Y (array): 2nx2n matrix, where n=2 is the number of modes involved
+            d (array): 2n vector, where n=2 is the number of modes involved
+            f (list):  list of Fock-state photon-number for each measured mode (for n=2, len(f)=1.)
+
+        Modes:
+            First mode is mode A which will not be measured.
+            Second mode is mode B which will be measured after the channel.
+
+        Raises:
+            ValueError: if the modes are not in the list of active modes
+            ValueError: if 2 and only 2 modes are not given.
+        """
+        if len(modes) == 2:
+            for m in modes:
+                if self.active[m] is None:
+                    raise ValueError("mode does not exist")
+        
+            # Apply channel using X, Y, and d according to PRXQ Eqn. 33.
+            Xexp, Yexp = self.expandXY(modes[0:2], X, Y)
+            
+            d0_expvec = symp.expand_vector(d[0]+1j*d[2],modes[0],self.nlen)
+            d1_expvec = symp.expand_vector(d[1]+1j*d[3],modes[1],self.nlen)
+            dexp = d0_expvec + d1_expvec
+            # TODO Calculation of expanded d vector needs to be generalized for n>2.
+
+            self.apply_channel(Xexp, Yexp, dexp)
+
+            # Measurement of mode B using Weyl transformation necessitates update
+            # of mode A and expansion of Gaussians in mode A.
+
+            # Calculate covariances and means for Fock state(s) using f for the photon number
+            fweights, fmeans, fcovs = super().prepare_fock(f[0])
+
+            # Prepare for reweights of length m*j. See Eqn. (36)-(38).
+            reweights = np.copy(self.weights)
+            for j in len(fweights):
+                reweights = np.append(reweights, self.weights)
+
+            ## Prepare the normalization factor for reweights using Eq. (31). The measurement covariance
+            # needs to be added to self.covs but only to the sigma_B part so the measurement covariance
+            # needs to be expanded to be the same size and ordering as self.covs.
+            expanded_fcovs = np.zeros((2 * self.nlen, 2 * self.nlen), dtype=complex)
+            expanded_fcovs[2:4,2:4] = fcovs[j,:,:]
+
+            # Adapted from measure_dyne to calculate probability distribution of the normalization
+            if self.covs.imag.any():
+                raise NotImplementedError("Covariance matrices must be real.")
+
+            # Indices for the relevant quadratures
+            quad_ind = np.concatenate((2 * np.array(modes), 2 * np.array(modes) + 1))
+            # Associated means and covs, already adding the covmat to the state covariances
+            means_quad = self.means[:, quad_ind]
+            covs_quad = self.covs[:, quad_ind, :][:, :, quad_ind].real + fcovs[j,:,:]
+            # Array to be filled with measurement samples
+            #vals = np.zeros((shots, 2 * len(modes)))
+
+            # Differences between the measurement means and the state means
+            expanded_fmeans = np.zeros(2 * self.nlen, dtype=complex)
+            expanded_fmeans[2 * self.nlen - 1:2 * self.nlen + 1] = fmeans[j,:,:]
+            diff_means = expanded_fmeans - means_quad
+            # Calculate arguments for the Gaussian functions used to calculate
+            # the exact probability distribution at the sampled point
+            exp_arg = np.einsum(
+                "...j,...jk,...k",
+                (diff_means),
+                np.linalg.inv(covs_quad),
+                (diff_means),
+            )
+
+            # Calculate the value of the probability distribution at the measured mean
+            # Prefactors for each exponential in the sum
+            prefactors = 1 / np.sqrt(np.linalg.det(2 * np.pi * covs_quad))
+            # Sum Gaussians
+            prob_dist_val = np.sum(self.weights * fweights * prefactors * np.exp(-0.5 * exp_arg)) # TODO may matrix multiply weights or do extra sum to sum over fweights too
+            # Should be real-valued
+            reweights_norm = np.real_if_close(prob_dist_val)
+
+            # end of what was adapted from measure_dyne
+
+            # If there are no more modes to measure simply set everything to vacuum
+            if len(modes) == len(self.active):
+                for mode in modes:
+                    self.loss(0, mode)
+            # If there are other active modes simply update based on measurement
+            else:
+                # Calculate updated cov and means according to PRXQ Eqn. (35). This should be done for every j.
+                for j in len(fweights):
+                    # adapting code from measure_threshold
+                    mode_ind = np.concatenate((2 * np.array(modes[1:2]), 2 * np.array(modes[1:2]) + 1))
+                    sigma_A, sigma_AB, sigma_B = ops.chop_in_blocks_multi(self.covs, mode_ind)
+                    sigma_A_prime = sigma_A - sigma_AB @ np.linalg.inv(
+                        sigma_B + fcovs[j,:,:]
+                    ) @ sigma_AB.transpose(0, 2, 1)
+                    mu_A, mu_B = ops.chop_in_blocks_vector_multi(self.means, mode_ind)
+                    mu_A_prime = mu_A + np.einsum(
+                        "...no,...o", sigma_AB @ np.linalg.inv(sigma_B + fcovs[j,:,:]), fmeans[j,:]-mu_B
+                    )
+                    # end adapting code from measure_threshold
+
+                    # Calculate updated coefficient matrix gamma_{m,j} according to PRXQ Eqn. (37) using
+                    # the already calculated normalization factor from above.
+                    # Adapted from measure_dyne to calculate probability distribution of the normalization
+                    
+                    means_quad = mu_B
+                    covs_quad = sigma_B.real + fcovs[j,:,:]
+
+                    # Differences between the measurement means and the state means
+                    diff_means = fmeans[j,:] - means_quad
+                    # Calculate arguments for the Gaussian functions used to calculate
+                    # the exact probability distribution at the sampled point
+                    exp_arg = np.einsum(
+                        "...j,...jk,...k",
+                        (diff_means),
+                        np.linalg.inv(covs_quad),
+                        (diff_means),
+                    )
+
+                    # Calculate the value of the probability distribution at the measured mean
+                    # Prefactors for each exponential in the sum
+                    prefactors = 1 / np.sqrt(np.linalg.det(2 * np.pi * covs_quad))
+                    # Sum Gaussians
+                    prob_dist_mvalues = self.weights * fweights[j] * prefactors * np.exp(-0.5 * exp_arg)
+                    # Should be real-valued
+                    reweights_numerator = np.real_if_close(prob_dist_mvalues)
+
+                    # end of what was adapted from measure_dyne
+
+                    # Need to update and expand means, covs, and weights because number of Gaussians has increased.
+                    # adapting code from measure_threshold
+                    if j==0:
+                        self.means = np.append(
+                            ops.reassemble_vector_multi(mu_A, mode_ind),
+                            ops.reassemble_vector_multi(mu_A_prime, mode_ind), 
+                            axis=0,
+                        )
+                        self.covs = np.append(
+                            ops.reassemble_multi(sigma_A, mode_ind),
+                            ops.reassemble_multi(sigma_A_prime, mode_ind),
+                            axis=0,
+                        )
+                        self.weights = reweights_numerator / reweights_norm
+                    else:
+                        self.means = np.append(
+                            self.means,np.append(
+                        ops.reassemble_vector_multi(mu_A, mode_ind),
+                        ops.reassemble_vector_multi(mu_A_prime, mode_ind), 
+                        axis=0,
+                        ), 
+                        axis=0,
+                        )
+                        self.covs = np.append(
+                            np.append(
+                            ops.reassemble_multi(sigma_A, mode_ind),
+                            ops.reassemble_multi(sigma_A_prime, mode_ind),
+                            axis=0,
+                        ), 
+                        axis=0,
+                        )
+                        self.weights = np.append(
+                            self.weights,
+                            reweights_numerator / reweights_norm,
+                            axis=0,
+                        )
+                    #end adapting code from measure_threshold
+            # Reset mode B to vacuum after measurement.
+            self.loss(0, modes[1])    
+            
+
+        raise ValueError("Requires 3 modes to function.")
+        raise NotImplementedError("More general transformation not yet implemented.")
 
     def phase_shift(self, phi, k):
         r"""Implement a phase shift in mode k.
@@ -990,14 +1183,15 @@ class BosonicModes:
         self.means = update_means(self.means, Us, self.from_xp)
         self.covs = update_covs(self.covs, Us, self.from_xp)
 
-    def apply_channel(self, X, Y):
+    def apply_channel(self, X, Y, d=None):
         r"""Transforms the state according to a deterministic Gaussian CPTP map.
 
         Args:
             X (array): matrix for multiplicative part of transformation
             Y (array): matrix for additive part of transformation
+            d (array): vector for additive part of transformation
         """
-        self.means = update_means(self.means, X, self.from_xp)
+        self.means = update_means(self.means, X, self.from_xp, d)
         self.covs = update_covs(self.covs, X, self.from_xp, Y)
 
     def expandS(self, modes, S):

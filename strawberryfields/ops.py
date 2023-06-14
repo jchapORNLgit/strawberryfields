@@ -1455,6 +1455,27 @@ class MSgate(Channel):
         ancillae_val = backend.mb_squeeze_single_shot(*reg, r, phi, r_anc, eta_anc)
         return ancillae_val / s
 
+class MNGgate(Channel):
+    r"""Phase space measurement-based non-Gaussian gate using photon-number detection.
+
+    This implements the two-mode non-Gaussian transformation described
+    Sec. IIIC of https://link.aps.org/doi/10.1103/PRXQuantum.2.040315
+    assuming the measurement is a projection onto a Fock state.
+
+    Args:
+        X (array): 2nx2n matrix, where n=2 is the number of modes involved
+        Y (array): 2nx2n matrix, where n=2 is the number of modes involved
+        d (list):  2n vector, where n=2 is the number of modes involved
+        f (list):  list of Fock-state photon-number for each measured mode (for n=2, one mode.)
+    """
+
+    def __init__(self, X, Y, d, f):
+        super().__init__([X, Y, d, f])
+
+    def _apply(self, reg, backend, **kwargs):
+        X, Y, d, f = par_evaluate(self.p)
+        backend.mb_NG_avg(reg, X, Y, d, f) # May need *reg instead
+        return None
 
 class PassiveChannel(Channel):
     r"""Perform an arbitrary multimode passive operation

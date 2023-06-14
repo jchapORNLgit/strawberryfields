@@ -749,6 +749,30 @@ class BosonicBackend(BaseBosonic):
         """
         ancillae_val = self.circuit.mb_squeeze_single_shot(mode, r, phi, r_anc, eta_anc)
         return ancillae_val
+    
+    
+
+    def mb_NG_avg(self, modes, X, Y, d, f):
+        r"""Phase space measurement-based non-Gaussian gate.
+
+        This implements the non-Gaussian transformation described
+        Sec. IIIC of https://link.aps.org/doi/10.1103/PRXQuantum.2.040315.
+
+        The two input modes and the measurement can be non-Gaussian. For
+        the measurement, we assume projection onto a Fock state (to simulate
+        photon-number resolved detection) for each measured mode with photon 
+        number from the list f.
+
+        Args:
+            modes (list): mode 1 is not measured, mode 2 will be measured after
+                          channel application.
+            X (array): 2nx2n matrix, where n=2 is the number of modes involved.
+            Y (array): 2nx2n matrix, where n=2 is the number of modes involved.
+            d (array): 2n vector, where n=2 is the number of modes involved.
+            f (list):  list of Fock-state photon-number for each measured mode (for n=2, one mode.)
+
+        """
+        self.circuit.mb_NG_avg(modes, X, Y, d, f)
 
     def beamsplitter(self, theta, phi, mode1, mode2):
         self.circuit.beamsplitter(theta, phi, mode1, mode2)
